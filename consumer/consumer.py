@@ -1,7 +1,7 @@
 """Avro order consumer with real-time aggregation (requirements R1, R3).
 
-Phase 4 scope: poll, deserialize, validate, aggregate, commit. Retry (phase 5)
-and DLQ routing (phase 6) are added to the same loop later.
+Phase 5 scope: poll, deserialize, validate, process under a retry policy,
+aggregate, commit. DLQ routing (phase 6) is added to the same loop later.
 
 Usage:
     python -m consumer.consumer
@@ -21,16 +21,19 @@ from common.config import settings
 from common.logging_setup import get_logger, setup_logging
 from common.schema import build_avro_deserializer, build_schema_registry_client
 from consumer.aggregator import OrderAggregator
+from consumer.failures import FailureSimulator, PermanentError
+from consumer.retry import RetryPolicy
 
 log = get_logger("consumer")
 
 
-class ValidationError(ValueError):
+class ValidationError(PermanentError):
     """Record decoded cleanly but violates a business rule.
 
     Distinct from a deserialization failure: the bytes were fine, the CONTENT is
-    not. Phase 5 classifies this as permanent -- retrying a negative price would
-    fail identically every time.
+    not. Subclasses PermanentError so the retry policy classifies it without a
+    special case: retrying a negative price would fail identically every time,
+    so it must not consume the retry budget.
     """
 
 
@@ -76,6 +79,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="override the consumer group id (default: from .env)")
     parser.add_argument("--poll-timeout", type=float, default=1.0,
                         help="seconds to block per poll (default: 1.0)")
+    parser.add_argument("--max-attempts", type=int, default=3,
+                        help="attempts per message before giving up (default: 3)")
+    parser.add_argument("--base-delay", type=float, default=0.5,
+                        help="first retry backoff in seconds, doubled each attempt (default: 0.5)")
+    parser.add_argument("--flaky-attempts", type=int, default=2,
+                        help="how many times a FLAKY order fails before succeeding (default: 2)")
     return parser.parse_args(argv)
 
 
@@ -84,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
 
     aggregator = OrderAggregator()
+
+    # The simulated downstream side effect, and the policy that governs retrying
+    # it. Both are injected into the loop rather than constructed inside it, so
+    # phase 7 can unit test the policy with a fake clock and no Kafka.
+    simulator = FailureSimulator(flaky_attempts_needed=args.flaky_attempts)
+    retry_policy = RetryPolicy(max_attempts=args.max_attempts, base_delay=args.base_delay)
+
     consumer = build_consumer(args.group_id)
     consumer.subscribe([settings.orders_topic])
 
@@ -127,26 +143,58 @@ def main(argv: list[str] | None = None) -> int:
                 consumer.commit(asynchronous=False)
                 continue
 
-            try:
+            context = (f"orderId={order.get('orderId')} "
+                       f"partition={msg.partition()} offset={msg.offset()}")
+
+            def process() -> None:
+                """One unit of work: validate, run the side effect, aggregate.
+
+                Passed to the retry policy as a single callable so that a retry
+                repeats the WHOLE unit. Validation is inside it because a
+                ValidationError raised here is classified as permanent and so
+                stops the policy immediately -- it costs no backoff.
+
+                The aggregator is updated LAST, and only on success. If it were
+                updated before the side effect, a message that failed twice and
+                then succeeded would be counted three times and would corrupt the
+                running average.
+                """
                 validate(order)
-                average = aggregator.add(order["product"], order["price"])
+                simulator.process(order)
+                aggregator.add(order["product"], order["price"])
+
+            outcome = retry_policy.execute(process, context=context)
+
+            if outcome.succeeded:
                 processed += 1
                 log.info(
                     "processed orderId=%-5s product=%-6s price=%7.2f | "
-                    "count=%-4d running_avg=%8.2f | partition=%d offset=%d",
+                    "count=%-4d running_avg=%8.2f | attempts=%d | partition=%d offset=%d",
                     order["orderId"], order["product"], order["price"],
-                    aggregator.count, average, msg.partition(), msg.offset(),
+                    aggregator.count, aggregator.running_average, outcome.attempts,
+                    msg.partition(), msg.offset(),
                 )
-            except ValidationError as exc:
-                # Phase 4 only logs and moves on. Phase 6 routes this to the DLQ.
+            else:
+                # Phase 6 routes this to the DLQ. For now it is logged and skipped,
+                # but the offset is still committed below -- see the note there.
                 failed += 1
-                log.error("INVALID orderId=%s error=%s | partition=%d offset=%d",
-                          order.get("orderId"), exc, msg.partition(), msg.offset())
+                log.error(
+                    "FAILED orderId=%s classification=%s attempts=%d error=%s | "
+                    "partition=%d offset=%d",
+                    order.get("orderId"), outcome.classification, outcome.attempts,
+                    outcome.error, msg.partition(), msg.offset(),
+                )
 
-            # Committed on BOTH paths. A record that can never succeed must not be
-            # retried forever: leaving it uncommitted would make the consumer
-            # re-read it on every restart and block the partition permanently.
-            # This is the same reasoning that governs DLQ routing in phase 6.
+            # Committed on BOTH paths -- success and failure alike.
+            #
+            # Note this happens AFTER the retry policy has finished, so a message
+            # retried three times commits exactly ONCE, not once per attempt: the
+            # retries happen inside the unit of work, not around it.
+            #
+            # A record that can never succeed must not be retried forever. Leaving
+            # it uncommitted would make the consumer re-read it on every poll and
+            # block the partition permanently. This is the same reasoning that
+            # governs committing after DLQ routing in phase 6.
             consumer.commit(asynchronous=False)
 
             if args.summary_every and processed and processed % args.summary_every == 0:
