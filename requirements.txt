@@ -1,0 +1,17 @@
+# Pinned exactly as specified in IMPLEMENTATION_PLAN.md section 2.
+# Versions are pinned (==) rather than floored (>=) so the marker's fresh clone
+# resolves to the same dependency tree that was demonstrated live.
+
+# Kafka client. The [avro,schemaregistry] extras pull in the Confluent Schema
+# Registry client and the Avro (de)serializers. NOT kafka-python: that library
+# has no Schema Registry integration, so it cannot satisfy requirement R2.
+confluent-kafka[avro,schemaregistry]==2.5.0
+
+# Avro encode/decode engine used underneath confluent-kafka's AvroSerializer.
+fastavro==1.9.4
+
+# Loads .env so no broker host, port or topic name is hardcoded (see section 11).
+python-dotenv==1.0.1
+
+# Unit tests for the aggregator, retry policy and DLQ payload (phase 7).
+pytest==8.2.0

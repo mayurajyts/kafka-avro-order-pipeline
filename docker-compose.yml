@@ -1,0 +1,99 @@
+# Development cluster for the order pipeline: one Kafka broker, Schema Registry
+# and Kafka UI. Single broker, replication factor 1 -- development only, NOT a
+# production HA topology (stated explicitly in IMPLEMENTATION_PLAN.md section 10).
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    ports:
+      # 9092 is the host-facing listener used by producer/consumer/tools running
+      # on the developer's machine. 29092 is the in-network listener used by the
+      # other containers -- see the two-listener explanation below.
+      - "9092:9092"
+    environment:
+      # --- KRaft mode: this node is both broker and controller, so no ZooKeeper
+      # container is needed. Fewer moving parts for a marker to start. ---
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # A fixed cluster id keeps the KRaft metadata log stable across restarts;
+      # without it the image would format a new cluster each time.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+      # --- Listeners ---
+      # Two listeners are required because a Kafka client always reconnects to the
+      # address the broker ADVERTISES, not the address it first dialled. A container
+      # (Schema Registry, Kafka UI) must be told "kafka:29092"; a process on the host
+      # must be told "localhost:9092". One listener cannot be correct for both.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # --- Single-broker sizing: these all default to 3 and would leave every
+      # internal topic under-replicated (and the consumer group unable to form)
+      # on a one-node cluster. ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by tools/create_topics.py with the partition
+      # counts the design calls for, so auto-creation is off: it would otherwise
+      # silently make a 1-partition "orders" on first produce and mask a mistake.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Listing topics proves the broker is actually serving the API, which is
+      # later than "the port is open" and is what Schema Registry needs.
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    depends_on:
+      kafka:
+        # Waits for the healthcheck above, not merely for the container to exist.
+        # Schema Registry exits on startup if it cannot reach the broker.
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # The Registry stores its schemas in a Kafka topic; on one broker that
+      # topic must also be replication factor 1.
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      # Pointing the UI at the Registry is what makes it decode Avro message
+      # values into readable JSON instead of showing raw bytes -- this is the
+      # evidence for requirement R2 during the live demo.
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  kafka-data:
