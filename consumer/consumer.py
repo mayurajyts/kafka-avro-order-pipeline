@@ -1,7 +1,7 @@
 """Avro order consumer with real-time aggregation (requirements R1, R3).
 
-Phase 5 scope: poll, deserialize, validate, process under a retry policy,
-aggregate, commit. DLQ routing (phase 6) is added to the same loop later.
+Full pipeline: poll, deserialize, validate, process under a retry policy,
+aggregate, route permanent failures to the DLQ, commit.
 
 Usage:
     python -m consumer.consumer
@@ -21,6 +21,7 @@ from common.config import settings
 from common.logging_setup import get_logger, setup_logging
 from common.schema import build_avro_deserializer, build_schema_registry_client
 from consumer.aggregator import OrderAggregator
+from consumer.dlq import DeadLetterQueue
 from consumer.failures import FailureSimulator, PermanentError
 from consumer.retry import RetryPolicy
 
@@ -99,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     # phase 7 can unit test the policy with a fake clock and no Kafka.
     simulator = FailureSimulator(flaky_attempts_needed=args.flaky_attempts)
     retry_policy = RetryPolicy(max_attempts=args.max_attempts, base_delay=args.base_delay)
+    dlq = DeadLetterQueue()
 
     consumer = build_consumer(args.group_id)
     consumer.subscribe([settings.orders_topic])
@@ -175,8 +177,9 @@ def main(argv: list[str] | None = None) -> int:
                     msg.partition(), msg.offset(),
                 )
             else:
-                # Phase 6 routes this to the DLQ. For now it is logged and skipped,
-                # but the offset is still committed below -- see the note there.
+                # No strategy remains for this message: it either failed
+                # permanently or exhausted its retries. Route it to the DLQ so the
+                # failure is recorded durably, then let the offset commit below.
                 failed += 1
                 log.error(
                     "FAILED orderId=%s classification=%s attempts=%d error=%s | "
@@ -184,17 +187,45 @@ def main(argv: list[str] | None = None) -> int:
                     order.get("orderId"), outcome.classification, outcome.attempts,
                     outcome.error, msg.partition(), msg.offset(),
                 )
+                dlq.publish(
+                    order=order,
+                    key=key,
+                    original_topic=msg.topic(),
+                    original_partition=msg.partition(),
+                    original_offset=msg.offset(),
+                    error=outcome.error,
+                    retry_count=outcome.attempts,
+                )
 
-            # Committed on BOTH paths -- success and failure alike.
+            # ================================================================
+            # WHY THE OFFSET IS COMMITTED EVEN AFTER ROUTING TO THE DLQ
+            # ================================================================
+            # Committed on BOTH paths -- success and DLQ alike.
             #
-            # Note this happens AFTER the retry policy has finished, so a message
-            # retried three times commits exactly ONCE, not once per attempt: the
-            # retries happen inside the unit of work, not around it.
+            # Kafka offsets are a single monotonic position per partition, not a
+            # per-message acknowledgement: there is no way to mark one record as
+            # "done" and leave an earlier one outstanding. So NOT committing a
+            # poison message does not retry just that message -- it pins the whole
+            # partition at that offset. The next poll returns the same record, it
+            # fails the same way, forever. That is head-of-line blocking: one bad
+            # message halts every good message queued behind it on that partition.
             #
-            # A record that can never succeed must not be retried forever. Leaving
-            # it uncommitted would make the consumer re-read it on every poll and
-            # block the partition permanently. This is the same reasoning that
-            # governs committing after DLQ routing in phase 6.
+            # Routing to the DLQ is what makes committing safe. The record is not
+            # discarded -- it has been durably written to orders.DLQ with the
+            # metadata needed to diagnose and replay it. Responsibility for the
+            # message has been TRANSFERRED, not abandoned, so the main stream is
+            # free to advance.
+            #
+            # Ordering matters and is deliberate: DLQ publish first, commit second.
+            # If the process died between them the message would be reprocessed and
+            # re-sent to the DLQ -- a duplicate, which is recoverable. Committing
+            # first would risk losing the record entirely if the DLQ write failed.
+            # At-least-once beats at-most-once when the payload is a failure report.
+            #
+            # This also happens AFTER the retry policy returns, so a message
+            # retried three times commits exactly ONCE, not once per attempt:
+            # retries live inside the unit of work, not around it.
+            # ================================================================
             consumer.commit(asynchronous=False)
 
             if args.summary_every and processed and processed % args.summary_every == 0:
@@ -221,7 +252,14 @@ def main(argv: list[str] | None = None) -> int:
         # summary until the ordering was flipped. The final aggregate table is
         # demo step 8 and the visible evidence for R3, so it must not depend on a
         # clean return from native code.
-        log.info("consumed=%d invalid=%d", processed, failed)
+        # Flush the DLQ BEFORE anything else can interrupt shutdown. Offsets for
+        # these messages are already committed, so an unflushed DLQ record would
+        # be lost with no way to recover it from the source topic.
+        outstanding = dlq.flush(timeout=10.0)
+        if outstanding:
+            log.error("DLQ flush left %d message(s) undelivered", outstanding)
+
+        log.info("consumed=%d failed=%d dlq_published=%d", processed, failed, dlq.published)
         print(aggregator.format_summary(), flush=True)
 
         # close() leaves the consumer group cleanly, so the coordinator reassigns
