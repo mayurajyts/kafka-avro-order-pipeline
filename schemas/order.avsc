@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.university.bigdata.orders",
+  "doc": "A single purchase transaction.",
+  "fields": [
+    { "name": "orderId", "type": "string", "doc": "Unique identifier, e.g. \"1001\"" },
+    { "name": "product", "type": "string", "doc": "Purchased item name, e.g. \"Item1\"" },
+    { "name": "price",   "type": "float",  "doc": "Product price (randomized)" }
+  ]
+}

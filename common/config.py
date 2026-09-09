@@ -10,8 +10,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
+
+# Repository root, derived from this file's location rather than the process's
+# current working directory. This is what lets `python -m producer.producer` and
+# `pytest` both resolve schemas/order.avsc no matter where they are invoked from.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Reads .env into the process environment if present. override=False means a
 # variable already exported in the shell wins over the file, which is what lets
@@ -48,6 +54,28 @@ class Settings:
     replication_factor: int = 1
     orders_partitions: int = 3
     dlq_partitions: int = 1
+
+    # Path to the Avro schema. Kept in config so no module hardcodes a filename.
+    schema_path: Path = PROJECT_ROOT / "schemas" / "order.avsc"
+
+    @property
+    def orders_value_subject(self) -> str:
+        """Schema Registry subject for the orders topic value.
+
+        Derived, not configured: confluent-kafka's default TopicNameStrategy
+        names the subject "<topic>-value". Computing it here rather than storing
+        a literal guarantees this string cannot drift out of sync with the topic
+        name if ORDERS_TOPIC is changed in .env.
+        """
+        return f"{self.orders_topic}-value"
+
+    def load_schema_str(self) -> str:
+        """Read order.avsc as text.
+
+        The Avro serializer takes the schema as a *string*, not a parsed dict,
+        because the Registry stores and compares the canonical text form.
+        """
+        return self.schema_path.read_text(encoding="utf-8")
 
     @classmethod
     def from_env(cls) -> "Settings":

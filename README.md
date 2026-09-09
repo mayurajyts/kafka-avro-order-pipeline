@@ -37,6 +37,13 @@ _Phase 8._ Producer → `orders` topic → consumer → {aggregator, DLQ}.
 - Docker Desktop (Kafka, Schema Registry and Kafka UI run in Compose — Phase 1)
 - Python 3.11
 
+> **Python 3.11 is required, not merely recommended.** The pinned
+> `confluent-kafka==2.5.0` and `fastavro==1.9.4` publish no CPython 3.13 wheels,
+> so on 3.13 pip falls back to building both from source and fails unless the
+> Microsoft C++ Build Tools are installed. On 3.11 both install as prebuilt
+> wheels with no compiler. If `py -0` does not list 3.11:
+> `winget install -e --id Python.Python.3.11`
+
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
